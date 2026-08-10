@@ -1,0 +1,214 @@
+name: Scheduled GACS Playwright Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date in YYYY-MM-DD format (manual run only, bypasses the automatic day-by-day backfill)"
+        required: false
+        default: ""
+
+      end_date:
+        description: "End date in YYYY-MM-DD format (manual run only)"
+        required: false
+        default: ""
+
+  schedule:
+    - cron: "0 * * * *"
+      # Every hour. GitHub does not reliably honor schedules more frequent
+      # than about once an hour, so this is the fastest cadence that
+      # actually fires close to on time. Each run processes one day after
+      # data/last_processed_date.txt, starting from 2026-07-19. During the
+      # current Asia/Riyadh day, hourly runs keep replacing today's partial
+      # rows. Once the day has ended, the processed-date marker advances and
+      # any still-missing station reports are appended to data/missing_gacs_reports.txt.
+
+concurrency:
+  group: gacs-scheduled-download
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run-playwright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      GACS_EMAIL: ${{ secrets.GACS_EMAIL }}
+      GACS_PASSWORD: ${{ secrets.GACS_PASSWORD }}
+      GACS_REPORT_TIMEOUT_SECONDS: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Verify GitHub secrets
+        run: |
+          if [ -z "$GACS_EMAIL" ]; then
+            echo "GACS_EMAIL secret is missing"
+            exit 1
+          fi
+
+          if [ -z "$GACS_PASSWORD" ]; then
+            echo "GACS_PASSWORD secret is missing"
+            exit 1
+          fi
+
+          echo "Secrets loaded successfully"
+
+      - name: Determine date to process
+        id: compute_date
+        shell: bash
+        env:
+          INPUT_START_DATE: ${{ inputs.start_date }}
+          INPUT_END_DATE: ${{ inputs.end_date }}
+        run: |
+          DEFAULT_START_DATE="2026-07-19"
+          STATE_FILE="data/last_processed_date.txt"
+          COMBINED_FILE="data/combined_all_station_reports.xlsx"
+
+          if [ -n "$INPUT_START_DATE" ]; then
+            REPORT_END="${INPUT_END_DATE:-$INPUT_START_DATE}"
+            echo "Manual run with explicit dates: $INPUT_START_DATE to $REPORT_END"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "update_state=false" >> "$GITHUB_OUTPUT"
+            echo "log_missing=false" >> "$GITHUB_OUTPUT"
+            echo "GACS_START_DATE=$INPUT_START_DATE" >> "$GITHUB_ENV"
+            echo "GACS_END_DATE=$REPORT_END" >> "$GITHUB_ENV"
+            if [ "$INPUT_START_DATE" = "$REPORT_END" ]; then
+              echo "REPORT_DATE=$INPUT_START_DATE" >> "$GITHUB_ENV"
+            fi
+            exit 0
+          fi
+
+          if [ ! -f "$COMBINED_FILE" ]; then
+            echo "Combined report is missing; restarting from $DEFAULT_START_DATE."
+            NEXT_DATE="$DEFAULT_START_DATE"
+          elif [ -f "$STATE_FILE" ]; then
+            LAST_DATE=$(tr -d '[:space:]' < "$STATE_FILE")
+            if [[ "$LAST_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+              NEXT_DATE=$(date -u -d "$LAST_DATE + 1 day" +%Y-%m-%d)
+            else
+              echo "Progress marker is empty or invalid; restarting from $DEFAULT_START_DATE."
+              NEXT_DATE="$DEFAULT_START_DATE"
+            fi
+          else
+            NEXT_DATE="$DEFAULT_START_DATE"
+          fi
+
+          TODAY=$(TZ=Asia/Riyadh date +%Y-%m-%d)
+          LAST_COMPLETE_DATE=$(TZ=Asia/Riyadh date -d "yesterday" +%Y-%m-%d)
+
+          if [[ "$NEXT_DATE" > "$TODAY" ]]; then
+            echo "Caught up: next date $NEXT_DATE is after today ($TODAY). Nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$NEXT_DATE" < "$LAST_COMPLETE_DATE" || "$NEXT_DATE" == "$LAST_COMPLETE_DATE" ]]; then
+            UPDATE_STATE=true
+            LOG_MISSING=true
+          else
+            UPDATE_STATE=false
+            LOG_MISSING=false
+          fi
+
+          echo "Processing date: $NEXT_DATE"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "update_state=$UPDATE_STATE" >> "$GITHUB_OUTPUT"
+          echo "log_missing=$LOG_MISSING" >> "$GITHUB_OUTPUT"
+          echo "GACS_START_DATE=$NEXT_DATE" >> "$GITHUB_ENV"
+          echo "GACS_END_DATE=$NEXT_DATE" >> "$GITHUB_ENV"
+          echo "REPORT_DATE=$NEXT_DATE" >> "$GITHUB_ENV"
+
+      - name: Run script
+        id: run_script
+        if: steps.compute_date.outputs.skip != 'true'
+        continue-on-error: true
+        run: python run_gacs_job.py
+
+      - name: Refresh data before merge
+        if: always() && steps.compute_date.outputs.skip != 'true'
+        run: git pull --rebase origin "$GITHUB_REF_NAME"
+
+      - name: Merge with previous combined report
+        if: always() && steps.compute_date.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          mkdir -p data
+          if [ -f combined_all_station_reports.xlsx ]; then
+            if [ -n "$REPORT_DATE" ]; then
+              # REPORT_DATE is a single in-progress or just-finished day: replace
+              # its old rows instead of appending, so re-runs pick up more hours.
+              python merge_combined_reports.py \
+                --previous data/combined_all_station_reports.xlsx \
+                --new combined_all_station_reports.xlsx \
+                --output data/combined_all_station_reports.xlsx \
+                --replace-date "$REPORT_DATE"
+            else
+              python merge_combined_reports.py \
+                --previous data/combined_all_station_reports.xlsx \
+                --new combined_all_station_reports.xlsx \
+                --output data/combined_all_station_reports.xlsx
+            fi
+          else
+            echo "No new combined report was produced this run; data/ unchanged."
+          fi
+
+      - name: Append missing-report log
+        if: always() && steps.compute_date.outputs.skip != 'true' && steps.compute_date.outputs.log_missing == 'true'
+        env:
+          RUN_STATUS: ${{ steps.run_script.outcome }}
+        run: |
+          mkdir -p data
+          python collect_missing_reports.py \
+            --date "$GACS_START_DATE" \
+            --run-status "$RUN_STATUS"
+
+      - name: Update processed-date state
+        if: always() && steps.compute_date.outputs.skip != 'true' && steps.compute_date.outputs.update_state == 'true'
+        run: |
+          mkdir -p data
+          echo "$REPORT_DATE" > data/last_processed_date.txt
+
+      - name: Commit updated data
+        if: always() && steps.compute_date.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+          else
+            git commit -m "Update combined report${REPORT_DATE:+ for $REPORT_DATE}"
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gacs-results-${{ github.run_number }}
+          path: |
+            **/*gacs_downloads/**
+            **/*.xlsx
+            **/*.csv
+            **/*.log
+            **/*.png
+            **/*.html
+          if-no-files-found: warn
+          retention-days: 30

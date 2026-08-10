@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.DS_Store
+~$*
+
+.env
+.env.*
+!.env.example
+
+gacs_session.json
+gacs_job.log
+
+*_gacs_downloads/
+gacs_downloads/
+/combined_all_station_reports.xlsx
+combined_gacs_reports.xlsx
