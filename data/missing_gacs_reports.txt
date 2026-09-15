@@ -5,3 +5,4 @@ RunAtUTC	ReportDate	Station	RunStatus	Reason
 2026-08-30T22:29:23Z	2026-08-30	ALL_STATIONS	failure	The workflow failed before station-level skipped reports were created.
 2026-08-31T21:46:21Z	2026-08-31	ALL_STATIONS	failure	The workflow failed before station-level skipped reports were created.
 2026-09-01T23:06:25Z	2026-09-01	ALL_STATIONS	failure	The workflow failed before station-level skipped reports were created.
+2026-09-15T21:18:27Z	2026-09-15	AIRFIELD	success	Report page did not update to one of ['Report for - 09/15/2026', 'Report for - 15/09/2026'] within 60 seconds.
